@@ -6,7 +6,7 @@ import math
 
 
 @dataclass
-class GPT2Config:
+class GPTConfig:
     block_size: int = 1024 # max length of the sequence
     vocab_size: int = 50257 # number of tokens in the vocabulary. 50,000 BPE merges + 256 bytes tokens + 1 <|endoftext|> token
     n_layer: int = 12 # number of layers in the transformer (hidden layers)
@@ -20,7 +20,7 @@ class CausalSelfAttention(nn.Module):
         assert config.n_embd % config.n_head == 0 # make sure that the n_embd is divisible by n_head
         # key, query, value projections for all heads, but in batch
         # the shape of the weight is (n_embd, n_embd * 3) because we need to project the key, query, and value
-        self.c_atten = nn.Linear(config.n_embd, config.n_embd * 3) # (C, 3C)
+        self.c_attn = nn.Linear(config.n_embd, 3 * config.n_embd) # (C, 3C)
         # output projection
         self.c_proj = nn.Linear(config.n_embd, config.n_embd) # (C, C)
         # regularization
@@ -118,3 +118,68 @@ class GPT(nn.Module):
     #     h = self.transformer['ln_f'](h) # normalize the output of the last block over the C dim => (B, T, C)
     #     lm_logits = self.lm_head(h) # linear layer to project the output of the last block to the vocab_size => (B, T, vocab_size)
     #     return lm_logits.view(*input_shape, -1)
+
+    @classmethod
+    def from_pretrained(cls, model_type):
+        """Loads pretrained GPT-2 model weights from Hugging Face's transformers library"""
+        assert model_type in {"gpt2", "gpt2-medium", "gpt2-large", "gpt2-xl"}
+        from transformers import GPT2LMHeadModel
+        print("loading weights from pretrained GPT: %s" % model_type)
+
+        # n_layer, n_head, and n_embd are determined from model_type
+        config_args = {
+            'gpt2':         dict(n_layer=12, n_head=12, n_embd=768),  # 124M params
+            'gpt2-medium':  dict(n_layer=24, n_head=16, n_embd=1024), # 350M params
+            'gpt2-large':   dict(n_layer=36, n_head=20, n_embd=1280), # 774M params
+            'gpt2-xl':      dict(n_layer=48, n_head=25, n_embd=1600), # 1558M params
+        }[model_type]
+        
+        config_args['vocab_size'] = 50257 # always 50257 for GPT model checkpoints
+        config_args['block_size'] = 1024 # always 1024 for GPT model checkpoints
+
+        # instantiate minGPT model from-scratch
+        config = GPTConfig(**config_args)
+        model = GPT(config)
+        sd = model.state_dict()
+        sd_keys = sd.keys() # getting all layers in the model
+        sd_keys = [k for k in sd_keys if not k.endswith('.attn.bias')] # discard the mask / buffer layers as this is just for the attention mask
+
+        # load pretrained model weights from Hugging Face's transformers library
+        model_hf = GPT2LMHeadModel.from_pretrained(model_type)
+        sd_hf = model_hf.state_dict()
+
+        # transfer pretrained weights from Hugging Face's transformers library to minGPT model
+        # copy while ensuring all of the parameters are aliggned and match in names and shapes
+        sd_keys_hf = sd_hf.keys()
+
+        # iterate over the layers in the minGPT model and also filter out the mask / buffer layers as its not parameters
+        sd_keys_hf = [k for k in sd_keys_hf if not k.endswith('.attn.masked_bias')] # ignore these, just a buffer
+        sd_keys_hf = [k for k in sd_keys_hf if not k.endswith('.attn.bias')] # same, just the mask (buffer)
+
+        # as some of the weight in the model is transposed in the implementation of the model with tensorflow
+        # we need to transpose it back so it can be aligned with the minGPT model with torch
+        transposed = ['attn.c_attn.weight', 'attn.c_proj.weight', 'mlp.c_fc.weight', 'mlp.c_proj.weight']
+
+        # basically the openai checkpoints use a "Conv1D" module, but we only want to use a vanilla Linear
+        # this means that we have to transpose these weights when we import them
+        assert len(sd_keys_hf) == len(sd_keys), f"mismatched keys: {len(sd_keys_hf)} != {len(sd_keys)}"
+        for k in sd_keys_hf:
+            if any(k.endswith(w) for w in transposed):
+                # print("transposing " + str(k) + " with shape " + str(sd_hf[k].shape) + " to " + str(sd[k].shape))
+                # special treatment for the Conv1D weights we need to transpose
+                assert sd_hf[k].shape[::-1] == sd[k].shape
+                with torch.no_grad():
+                    # fill the weight in the minGPT model with the transposed weight from the Hugging Face's transformers library
+                    sd[k].copy_(sd_hf[k].t())
+            else:
+                # vanilla copy over the other parameters
+                assert sd_hf[k].shape == sd[k].shape
+                with torch.no_grad():
+                    sd[k].copy_(sd_hf[k])
+        
+        return model
+    
+
+# =========================Running model=========================
+model = GPT.from_pretrained("gpt2")
+print("Model loaded successfully!")
