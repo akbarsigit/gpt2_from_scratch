@@ -35,8 +35,10 @@ class CausalSelfAttention(nn.Module):
     def forward(self, x):
         B, T, C = x.size() # get the batch size, sequence length, and the embedding dimension (n_embd (C))
 
-        qkv = self.c_atten(x) # project the input to key, query, and value => (B, T, 3C)
+        qkv = self.c_attn(x) # project the input to key, query, and value => (B, T, 3C)
         q, k, v = qkv.split(C, dim=2) # split the key, query, and value => (B, T, C) each
+
+        # nh is the number of heads, hs is the size of the head
         k = k.view(B, T, self.n_head, C // self.n_head).transpose(1, 2) # (B, T, nh, hs) => split the key to n_head => (B, n_head, T, C // n_head) => (B, nh, T, hs)
         q = q.view(B, T, self.n_head, C // self.n_head).transpose(1, 2) # (B, T, nh, hs) => split the query to n_head => (B, n_head, T, C // n_head) => (B, nh, T, hs)
         v = v.view(B, T, self.n_head, C // self.n_head).transpose(1, 2) # (B, T, nh, hs) => split the value to n_head => (B, n_head, T, C // n_head) => (B, nh, T, hs)
@@ -106,18 +108,31 @@ class GPT(nn.Module):
 
         self.lm_head = nn.Linear(config.n_embd, config.vocab_size, bias=False)
 
-    # def forward(self, x):
-    #     # note: x here was tokenized, and the shape is (B, T). All possible tokens are in the range of vocab_size
-    #     # that we have the representation of it in the wte embedding layer
-    #     B, T = x.shape
-    #     wte = self.transformer['wte'](x) # lookup the token in the embedding layer => (B, T, n_embd/C)
-    #     wpe = self.transformer['wpe'](torch.arange(T, device=x.device)) # lookup the position in the embedding layer => (T, n_embd/C)
-    #     h = wte + wpe # sum the token and position embedding => (B, T, C) + (T, C) => (B, T, C) + (B, T, C) => (B, T, C) // kindda like summation of the C dimension
-    #     for block in self.transformer['h']:
-    #         h = block(h)
-    #     h = self.transformer['ln_f'](h) # normalize the output of the last block over the C dim => (B, T, C)
-    #     lm_logits = self.lm_head(h) # linear layer to project the output of the last block to the vocab_size => (B, T, vocab_size)
-    #     return lm_logits.view(*input_shape, -1)
+    def forward(self, idx):
+        # note: idx here was tokenized, and the shape is (B, T). All possible tokens are in the range of vocab_size
+        # that we have the representation of it in the wte embedding layer
+        B, T = idx.size()
+        assert T <= self.config.block_size, "Cannot forward sequence of length {T}, block size is {self.config.block_size}"
+        
+        # foward the token and position embedding
+        pos = torch.arange(0, T, dtype=torch.long, device=idx.device) # shape (T)
+        pos_emb = self.transformer.wpe(pos) # shape (T, C). note C = n_embd
+        tok_emb = self.transformer.wte(idx) # shape (B, T, C)
+        x = tok_emb + pos_emb # shape (B, T, C)
+
+        # foward the blocks of the transformer
+        for block in self.transformer.h:
+            x = block(x)
+        
+        # forward the last layer norm and the classifier head
+        x = self.transformer.ln_f(x) # shape (B, T, C)
+        logits = self.lm_head(x) # shape (B, T, vocab_size)
+
+        # note. So the logic here is, if we have input B, T
+        # so each B, T, we will calculate every single logits for what token comes next in the sequence.
+        # so what is the B, T+1 sequence will be, we will calculate the logits for each token in the vocab_size
+        return logits
+
 
     @classmethod
     def from_pretrained(cls, model_type):
@@ -183,3 +198,49 @@ class GPT(nn.Module):
 # =========================Running model=========================
 model = GPT.from_pretrained("gpt2")
 print("Model loaded successfully!")
+
+model.eval()
+model.to('cuda')
+
+num_return_sequences = 5
+max_length = 32
+
+import tiktoken
+enc = tiktoken.get_encoding("gpt2")
+tokens = enc.encode("Hello, akbar is so cool that")
+
+# https://tiktokenizer.vercel.app/?model=gpt2
+tokens = torch.tensor(tokens, dtype=torch.long) # (9, )
+tokens = tokens.unsqueeze(0).repeat(num_return_sequences, 1)
+x = tokens.to('cuda')
+
+# generate!
+# right now x is (B, T) where B = 5, T = 9
+torch.manual_seed(42)
+torch.cuda.manual_seed(42)
+
+while x.size(1) < max_length:
+    # foward the model to reproduce the logits
+    with torch.no_grad():
+        logits = model(x) # (B, T, vocab_size)
+        # take the logits of the last token
+        logits = logits[:, -1, :]
+        # get the probability distribution
+        probs = F.softmax(logits, dim=-1)
+        # do top k sampling to get the next token of 50 (huggingface pipeline default)
+        # topk_probs here becomes (5, 50), topk_indices becomes (5, 50)
+        topk_probs, topk_indices = torch.topk(probs, 50, dim=-1)
+        # select a token randomly from the top k
+        ix = torch.multinomial(topk_probs, num_samples=1) # (B, 1)
+        # gather the corresponding indices
+        xcol = torch.gather(topk_indices, -1, ix) # (B, 1)
+        # append the new token to the sequence  
+        x = torch.cat((x, xcol), dim=1)
+
+# print the generated sequences
+for i in range(num_return_sequences):
+    tokens = x[i, :max_length].tolist()
+    decoded = enc.decode(tokens)
+    print(">", decoded)
+
+
