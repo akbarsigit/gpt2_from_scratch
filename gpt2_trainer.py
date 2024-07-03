@@ -108,7 +108,25 @@ class GPT(nn.Module):
 
         self.lm_head = nn.Linear(config.n_embd, config.vocab_size, bias=False)
 
-    def forward(self, idx):
+        # weight sharing (tieing) scheme
+        # so the logic behind this is because there will be some semantic meaning between the token embedding
+        # and the output layer, so we want to share the weight between the token embedding and the output layer
+        # We also saving 768 * 50257 =~ 40M parameters (30% of the model size of 124M)
+        self.transformer.wte.weight = self.lm_head.weight
+
+        # initialize the weights
+        self.apply(self._init_weights)
+
+
+    def _init_weights(self, module):
+        if isinstance(module, nn.Linear):
+            torch.nn.init.normal_(module.weight, mean=0.0, std=0.02)
+            if module.bias is not None:
+                torch.nn.init.zeros_(module.bias)
+        elif isinstance(module, nn.Embedding):
+            torch.nn.init.normal_(module.weight, mean=0.0, std=0.02)
+
+    def forward(self, idx, targets=None):
         # note: idx here was tokenized, and the shape is (B, T). All possible tokens are in the range of vocab_size
         # that we have the representation of it in the wte embedding layer
         B, T = idx.size()
@@ -131,7 +149,14 @@ class GPT(nn.Module):
         # note. So the logic here is, if we have input B, T
         # so each B, T, we will calculate every single logits for what token comes next in the sequence.
         # so what is the B, T+1 sequence will be, we will calculate the logits for each token in the vocab_size
-        return logits
+
+        # if we have the target, we will calculate the loss
+        loss = None
+        if targets is not None:
+            # this will be (B*T, vocab_size) F (B*T) => (loss)
+            loss = F.cross_entropy(logits.view(-1, logits.size(-1)), targets.view(-1))
+
+        return logits, loss
 
 
     @classmethod
@@ -193,31 +218,112 @@ class GPT(nn.Module):
                     sd[k].copy_(sd_hf[k])
         
         return model
+
+
+# =========================Detecting Device=========================
+device = "cpu"
+if torch.cuda.is_available():
+    device = "cuda"
+print("Using %s" % device)
+
+# # =========================Tokenizing=========================
+# enc = tiktoken.get_encoding("gpt2")
+# # tokens = enc.encode("Hello, akbar is so cool that")
+
+# # load the datasets to train the model
+# with open('input.txt', 'r') as f:
+#     text = f.read()
+
+# text = text[:1000]
+# tokens = enc.encode(text)
+
+# ===============Data Loader=========================
+import tiktoken
+
+class DataLoaderLite:
+    def __init__(self, B, T):
+        self.B = B
+        self.T = T
+       
+        with open('input.txt', 'r') as f:
+            text = f.read()
+        
+        enc = tiktoken.get_encoding("gpt2")
+        tokens = enc.encode(text)
+        self.tokens = torch.tensor(tokens)
+        print(f"loaded {len(self.tokens)} tokens")
+        print(f"1 epoch = {len(self.tokens) // (B * T)} batches")
+
+        # state
+        self.current_position = 0
     
+    def next_batch(self):
+        B, T = self.B, self.T
+        buf = self.tokens[self.current_position : self.current_position + B * T + 1]
+        x = buf[:-1].view(B, T) # inputs
+        y = buf[1:].view(B, T) # targets => we offset the target by 1
+
+        # move the position
+        self.current_position += B * T
+
+        # reset the position if we reach the end of the dataset
+        if self.current_position + (B * T + 1) >= len(self.tokens):
+            self.current_position = 0
+        return x, y
+
+
+# =================Batching/Creating datasets==================
+# create 4 batch of 32 sequence length
+# B, T = 4, 32
+# buf = torch.tensor(tokens[:B*T + 1])
+# buf = buf.to(device)
+
+# x = buf[:-1].view(B, T)
+# y = buf[1:].view(B, T)
+
+
+
+# model = GPT.from_pretrained("gpt2") # loading pretrained weights
+model = GPT(GPTConfig()) # random initialization of the model
+print("Model loaded successfully!")
+# model.eval()  #when doing generation, do this
+
+model.to(device)
+
+# print(loss) # tensor(11.0831, grad_fn=<NllLossBackward0>)
+# print(loss.shape) # torch.Size([])
+
+train_loader = DataLoaderLite(B=4, T=32)
+
+optimizer = torch.optim.Adam(model.parameters(), lr=3e-4)
+for i in range(50):
+    x, y = train_loader.next_batch()
+    x, y = x.to(device), y.to(device)
+
+    optimizer.zero_grad()
+    logits, loss = model(x, y)
+    loss.backward()
+    optimizer.step()
+    print(f"step {i}, loss: {loss.item()}")
+
+
+import sys; sys.exit()
+
+
 
 # =========================Running model=========================
-model = GPT.from_pretrained("gpt2")
-print("Model loaded successfully!")
-
-model.eval()
-model.to('cuda')
-
 num_return_sequences = 5
 max_length = 32
-
-import tiktoken
-enc = tiktoken.get_encoding("gpt2")
-tokens = enc.encode("Hello, akbar is so cool that")
-
 # https://tiktokenizer.vercel.app/?model=gpt2
 tokens = torch.tensor(tokens, dtype=torch.long) # (9, )
 tokens = tokens.unsqueeze(0).repeat(num_return_sequences, 1)
-x = tokens.to('cuda')
+x = tokens.to(device)
 
-# generate!
 # right now x is (B, T) where B = 5, T = 9
 torch.manual_seed(42)
 torch.cuda.manual_seed(42)
+
+# =========================Generate=========================
 
 while x.size(1) < max_length:
     # foward the model to reproduce the logits
