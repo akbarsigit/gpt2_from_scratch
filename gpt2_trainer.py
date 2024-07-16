@@ -23,6 +23,10 @@ class CausalSelfAttention(nn.Module):
         self.c_attn = nn.Linear(config.n_embd, 3 * config.n_embd) # (C, 3C)
         # output projection
         self.c_proj = nn.Linear(config.n_embd, config.n_embd) # (C, C)
+
+        # flagging for linear layer scaler
+        self.c_proj.MYGPT_SCALE_INIT = 1
+
         # regularization
         self.n_head = config.n_head
         self.n_embd = config.n_embd
@@ -44,11 +48,17 @@ class CausalSelfAttention(nn.Module):
         v = v.view(B, T, self.n_head, C // self.n_head).transpose(1, 2) # (B, T, nh, hs) => split the value to n_head => (B, n_head, T, C // n_head) => (B, nh, T, hs)
 
         # here, we calculate the attention score
-        att = (q @ k.transpose(-2, -1)) * (1.0 / math.sqrt(k.size(-1))) # (B, nh, T, hs) @ (B, nh, hs, T) => (B, nh, T, T)
-        att = att.masked_fill(self.bias[:, :, :T, :T] == 0, float('-inf')) # mask the attention score => (B, nh, T, T)
-        att = F.softmax(att, dim=-1) # softmax the attention score => (B, nh, T, T)
+        # att = (q @ k.transpose(-2, -1)) * (1.0 / math.sqrt(k.size(-1))) # (B, nh, T, hs) @ (B, nh, hs, T) => (B, nh, T, T)
+        # att = att.masked_fill(self.bias[:, :, :T, :T] == 0, float('-inf')) # mask the attention score => (B, nh, T, T)
+        # att = F.softmax(att, dim=-1) # softmax the attention score => (B, nh, T, T)
+        # y = att @ v # (B, nh, T, T) @ (B, nh, T, hs) => (B, nh, T, hs)
 
-        y = att @ v # (B, nh, T, T) @ (B, nh, T, hs) => (B, nh, T, hs)
+        # we can comment this 4 lines above to call flashattention.
+        # basically, the torch.compile cannot optimize the attention mechanism
+        # so we use flashattention fused the kernel and do softmax in the streaming manner (online softmax calculation).
+        # We also dont need to store the TxT attention matrix in the GPU memory (HBO)
+        y = F.scaled_dot_product_attention(q, k, v, is_causal=True)
+
         # re-assemble all head outputs side by side
         y = y.transpose(1, 2).contiguous().view(B, T, C) # (B, nh, T, hs) => (B, T, nh, hs) => (B, T, C)
         # output projection
@@ -69,6 +79,7 @@ class MLP(nn.Module):
         # and it allow the gradient to flow
         self.gelu = nn.GELU(approximate='tanh')
         self.c_proj = nn.Linear(config.n_embd * 4, config.n_embd)
+        self.c_proj.MYGPT_SCALE_INIT = 1
 
     def forward(self, x):
         x = self.c_fc(x)
@@ -120,6 +131,10 @@ class GPT(nn.Module):
 
     def _init_weights(self, module):
         if isinstance(module, nn.Linear):
+            std = 0.02
+            if hasattr(module, 'MYGPT_SCALE_INIT'):
+                std *= (2 * self.config.n_layer) ** -0.5
+
             torch.nn.init.normal_(module.weight, mean=0.0, std=0.02)
             if module.bias is not None:
                 torch.nn.init.zeros_(module.bias)
@@ -218,6 +233,11 @@ class GPT(nn.Module):
                     sd[k].copy_(sd_hf[k])
         
         return model
+    
+    def configure_optimizers(self, weight_decay, learning_rate, device):
+        # find/start with all of the candidate parameters that require grad
+        param_dict = {pn: p for pn, p in self.named_parameters()}
+        
 
 
 # =========================Detecting Device=========================
@@ -225,6 +245,12 @@ device = "cpu"
 if torch.cuda.is_available():
     device = "cuda"
 print("Using %s" % device)
+
+# =========================Reproduce Ability=========================
+torch.manual_seed(42)
+if torch.cuda.is_available():
+    torch.cuda.manual_seed(42)
+
 
 # # =========================Tokenizing=========================
 # enc = tiktoken.get_encoding("gpt2")
@@ -281,33 +307,85 @@ class DataLoaderLite:
 # x = buf[:-1].view(B, T)
 # y = buf[1:].view(B, T)
 
-
+# Activating TF32 Precision
+torch.set_float32_matmul_precision('high')
 
 # model = GPT.from_pretrained("gpt2") # loading pretrained weights
-model = GPT(GPTConfig()) # random initialization of the model
+# model = GPT(GPTConfig()) # random initialization of the model
+model = GPT(GPTConfig(vocab_size=50304)) # now we actually increase the vocab with dummy tokens so that it has good numbers. 50304 
+                                         # can have many 2^x factors, so it can be breaking down to many factors in cuda computations 
 print("Model loaded successfully!")
 # model.eval()  #when doing generation, do this
-
 model.to(device)
+
+# what compile is doing is to make the model not run in eager mode, so not layer by layer
+# instead, it will look at the whole model and optimize its round trip (read/write) using so called kernel fusion
+model = torch.compile(model) # compile for the NN => like GCC for c/c++ code => for speedup
+
+
+
+# doing learning rate scheduling
+max_lr = 6e-4
+min_lr = max_lr * 0.1 # this is 10% of the max lr
+warmup_steps = 10
+max_steps = 50
+def get_lr(it):
+    # 1) linear warmup for warmup_iters steps
+    if it < warmup_steps:
+        return max_lr * (it+1) / warmup_steps
+    # 2) if it > lr_deacy_iters, return min learning rate
+    if it >= max_steps:
+        return min_lr
+    # 3) in between, use cosine learning rate decay down to min learning rate
+    decay_ratio = (it - warmup_steps) / (max_steps - warmup_steps)
+    assert 0 <= decay_ratio <= 1
+    coeff = 0.5 * (1.0 + math.cos(math.pi * decay_ratio)) # coeff starts at 1 and goes to 0     
+    return min_lr + coeff * (max_lr - min_lr)
 
 # print(loss) # tensor(11.0831, grad_fn=<NllLossBackward0>)
 # print(loss.shape) # torch.Size([])
 
+import time
+
 train_loader = DataLoaderLite(B=4, T=32)
 
-optimizer = torch.optim.Adam(model.parameters(), lr=3e-4)
-for i in range(50):
+# this params is got from GPT3 paper
+# optimizer = torch.optim.AdamW(model.parameters(), lr=3e-4, betas=(0.9, 0.95), eps=1e-8)
+optimizer = model.configure_optimizers(weight_decay=0.1, learning_rate=6e-4, device=device)
+
+for step in range(max_steps):
+    t0 = time.time()
     x, y = train_loader.next_batch()
     x, y = x.to(device), y.to(device)
-
     optimizer.zero_grad()
+
+    # using bfloat on foward pass => some will be keep on float32 and some, mainly on matmul will be on bfloat16
+    # with torch.autocast(device_type=device, dtype=torch.bfloat16): => comment this because dont have supported GPU hardware
     logits, loss = model(x, y)
     loss.backward()
+
+    # global gradient clipping - to prevent gradient explosion
+    # basically, we will power of two all the gradient, sum them all, and then sqrt them, or having a norm of 1
+    # this is to prevent the gradient to be too big, if we have unlucky iteration that have big loss, so it will not explode
+    norm = torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
+
+    # determine and set the learning rate for this iteration
+    # we do this because we want to do learning rate decay scheduling
+    lr = get_lr(step)
+    for param_group in optimizer.param_groups:
+        param_group['lr'] = lr
+
     optimizer.step()
-    print(f"step {i}, loss: {loss.item()}")
+
+    torch.cuda.synchronize()
+    t1 = time.time()
+    dt = (t1 - t0) * 1000
+    tokens_per_sec = (train_loader.B * train_loader.T) / (t1 - t0)
+
+    print(f"step {step:4d} | loss: {loss.item():.6f} | lr {lr:.4e} | norm: {norm:.4f} | time: {dt:.2f}ms | tok/sec: {tokens_per_sec:.2f}")
 
 
-import sys; sys.exit()
+import sys; sys.exit(0)
 
 
 
