@@ -3,6 +3,7 @@ import torch
 import torch.nn as nn
 from torch.nn import functional as F
 import math
+import inspect
 
 
 @dataclass
@@ -237,7 +238,31 @@ class GPT(nn.Module):
     def configure_optimizers(self, weight_decay, learning_rate, device):
         # find/start with all of the candidate parameters that require grad
         param_dict = {pn: p for pn, p in self.named_parameters()}
-        
+        param_dict = {pn: p for pn, p in param_dict.items() if p.requires_grad}
+
+        # create optim groups, any parameter that is 2D will be weight decayed, otherwise no
+        # i.e. all weight tensors in matmuls + embeddings will be weight decayed, all biases and layer norms will not
+        decay_params = [p for n, p in param_dict.items() if p.dim() >= 2]
+        no_decay_params = [p for n, p in param_dict.items() if p.dim() < 2]
+        optim_groups = [
+            {"params": decay_params, "weight_decay": weight_decay},
+            {"params": no_decay_params, "weight_decay": 0.0},
+        ]
+
+        # calculate the number of parameters in each group
+        num_decay_params = sum(p.numel() for p in decay_params)
+        num_no_decay_params = sum(p.numel() for p in no_decay_params)
+
+        print(f"num decayed parameter tensors: {len(decay_params)}, with {num_decay_params:,} parameters")
+        print(f"num non-decayed parameter tensors: {len(no_decay_params)}, with {num_no_decay_params:,} parameters")
+
+        # create AdamW optimizer and use the fused version if it's available
+        fused_available = 'fused' in inspect.signature(torch.optim.AdamW).parameters
+        use_fused = fused_available and 'cuda' in device
+        print(f"using fused AdamW: {use_fused}")
+
+        optimizer = torch.optim.AdamW(optim_groups, lr=learning_rate, betas=(0.9, 0.95), eps=1e-8, fused=use_fused)
+        return optimizer
 
 
 # =========================Detecting Device=========================
@@ -322,8 +347,6 @@ model.to(device)
 # instead, it will look at the whole model and optimize its round trip (read/write) using so called kernel fusion
 model = torch.compile(model) # compile for the NN => like GCC for c/c++ code => for speedup
 
-
-
 # doing learning rate scheduling
 max_lr = 6e-4
 min_lr = max_lr * 0.1 # this is 10% of the max lr
@@ -347,7 +370,22 @@ def get_lr(it):
 
 import time
 
-train_loader = DataLoaderLite(B=4, T=32)
+# Here, we are using gradient accumulator. This will simulate the idea of having a bigger batch size.
+# on the paper, for 125 M params, there are 0.5 M batch size. This batch size mean however, is token processed 
+# in one iteration, so here, we have 0.5e6 / 1024 = 488 batch size (B). But this is too big and cannot be processed.
+# so with gradient accumulator, we still have 4 batch size, but we accumulate the gradient for 128 times, before
+# updating the model. This is to simulate the idea of having a bigger batch size.
+# total_batch_size = 524288 # 2**19, ~0.5M in number of tokens
+total_batch_size = 4096
+B = 4 # micro batch size => num of rows 
+T = 16 # sequence length => num of columns
+
+assert total_batch_size % (B * T) == 0, "make sure total_batch_size is divisible by B * T"
+grad_accum_steps = total_batch_size // (B * T)
+print(f"total desired batch size: {total_batch_size}")
+print(f"=> calculated gradient accumulation steps: {grad_accum_steps}")
+
+train_loader = DataLoaderLite(B=B, T=T)
 
 # this params is got from GPT3 paper
 # optimizer = torch.optim.AdamW(model.parameters(), lr=3e-4, betas=(0.9, 0.95), eps=1e-8)
@@ -355,14 +393,26 @@ optimizer = model.configure_optimizers(weight_decay=0.1, learning_rate=6e-4, dev
 
 for step in range(max_steps):
     t0 = time.time()
-    x, y = train_loader.next_batch()
-    x, y = x.to(device), y.to(device)
     optimizer.zero_grad()
+    loss_accum = 0.0
+    # this will do gradient accumulation that simulate using a bigger batch size
+    for micro_step in range(grad_accum_steps):
+        x, y = train_loader.next_batch()
+        x, y = x.to(device), y.to(device)
+        # using bfloat on foward pass => some will be keep on float32 and some, mainly on matmul will be on bfloat16
+        # if torch.cuda.is_bf16_supported():
+        #     with torch.autocast(device_type=device, dtype=torch.bfloat16): # => comment this because dont have supported GPU hardware
+        #         logits, loss = model(x, y)  
+        # else:
+        logits, loss = model(x, y)
 
-    # using bfloat on foward pass => some will be keep on float32 and some, mainly on matmul will be on bfloat16
-    # with torch.autocast(device_type=device, dtype=torch.bfloat16): => comment this because dont have supported GPU hardware
-    logits, loss = model(x, y)
-    loss.backward()
+        # this devision is to recover the loss scale, because we are doing gradient accumulation
+        # ex. if we have 4 micro step with 1 batch each, then on loss, if we have loss average for each batch,
+        # then we only will calculate loss of average 1, then it will have wrong gradient accumulation representation
+        # (will sorta lose the average of the 4). So we need to recover it by dividing it with the 4 or grad_accum_steps 
+        loss = loss / grad_accum_steps
+        loss_accum += loss.detach() # detach to remove the tensor from the graph, and only keep track of the value
+        loss.backward()
 
     # global gradient clipping - to prevent gradient explosion
     # basically, we will power of two all the gradient, sum them all, and then sqrt them, or having a norm of 1
@@ -380,9 +430,11 @@ for step in range(max_steps):
     torch.cuda.synchronize()
     t1 = time.time()
     dt = (t1 - t0) * 1000
-    tokens_per_sec = (train_loader.B * train_loader.T) / (t1 - t0)
 
-    print(f"step {step:4d} | loss: {loss.item():.6f} | lr {lr:.4e} | norm: {norm:.4f} | time: {dt:.2f}ms | tok/sec: {tokens_per_sec:.2f}")
+    tokens_processed = train_loader.B * train_loader.T * grad_accum_steps
+    tokens_per_sec = (tokens_processed) / (t1 - t0)
+
+    print(f"step {step:4d} | loss: {loss_accum.item():.6f} | lr {lr:.4e} | norm: {norm:.4f} | time: {dt:.2f}ms | tok/sec: {tokens_per_sec:.2f}")
 
 
 import sys; sys.exit(0)
